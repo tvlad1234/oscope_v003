@@ -2,9 +2,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#define I2C_GPIO GPIOD
-#define I2C_SDA_PIN 6
-#define I2C_SCL_PIN 5
+#define I2C_GPIO GPIOA
+#define I2C_SDA_PIN 2
+#define I2C_SCL_PIN 1
 
 #include "ch32v003_I2C_bitbang.h"
 #define SSD1306_ADDR_CMD 0x00

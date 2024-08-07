@@ -10,31 +10,38 @@
 #include "gfx.h"
 #include "ssd1306.h"
 
-#define AN_IN_GPIO GPIOC
-#define AN_IN_PIN 4
-#define AN_IN_CH 2
-
-#define BTN_L_GPIO GPIOC
-#define BTN_L_PIN 2
-
-#define BTN_C_GPIO GPIOC
-#define BTN_C_PIN 6
+#define AN_IN_GPIO GPIOD
+#define AN_IN_PIN 5
+#define AN_IN_CH 5
 
 #define BTN_R_GPIO GPIOD
-#define BTN_R_PIN 4
+#define BTN_R_PIN 6
+
+#define BTN_C_GPIO GPIOC
+#define BTN_C_PIN 1
+
+#define BTN_L_GPIO GPIOD
+#define BTN_L_PIN 4
 
 #define RISING 1
 #define FALLING 0
 
-#define volts_from_adc(s) (((3.3f * s / 1023.0f) - 1.65f) * 2.0f)
+#define volts_from_adc(s) (((3.3f * s / 1023.0f) - 1.75f) * 2.0f)
+
+#define PIXDIV 16
+#define YDIV 4
+#define XDIV 4
 
 // ADC capture buffers
-#define BUFFER_LENGTH 60
+#define BUFFER_LENGTH 64
 volatile uint16_t buffer1[BUFFER_LENGTH] = {0};
 volatile uint16_t buffer2[BUFFER_LENGTH] = {0};
 
 volatile uint8_t dma_ready = 0; // DMA ready (conversion done) flag
 volatile uint16_t *p;			// variable used for swapping pointers around
+
+// available volts/division
+const float availableVoltDiv[] = {0.5f, 1.0f, 2.0f, 0.0f};
 
 // available ADC clock dividers
 const uint8_t availableAdcDivs[] = {2, 4, 6, 8, 12, 16, 24, 32, 64, 96, 128, 0};
@@ -55,6 +62,7 @@ float sampPer;
 enum
 {
 	UI_NONE,
+	UI_VDIV,
 	UI_TDIV,
 	UI_TRIGLEV,
 	UI_TRIGSLOPE,
@@ -93,11 +101,11 @@ void arm_dma()
 	// Start DMA clock
 	RCC->AHBPCENR |= RCC_AHBPeriph_DMA1;
 
-	// Setup DMA Channel 1 (adc triggered) as reading, 16-bit, linear buffer
+	// Setup DMA Channel 1 (ADC triggered) as reading, 16-bit, linear buffer
 	DMA1_Channel1->CFGR =
 		DMA_DIR_PeripheralSRC | DMA_MemoryInc_Enable | DMA_PeripheralDataSize_HalfWord | DMA_MemoryDataSize_HalfWord;
 
-	// No of samples to get before irq
+	// Number of samples to get before irq
 	DMA1_Channel1->CNTR = BUFFER_LENGTH;
 
 	// Source
@@ -132,7 +140,7 @@ void init_adc()
 	ADC1->RSQR3 = AN_IN_CH;
 
 	// Possible times: 0->3,1->9,2->15,3->30,4->43,5->57,6->73,7->241 cycles
-	ADC1->SAMPTR2 = 1 /*9 cycles*/ << (3 /*offset per channel*/ * 2 /*channel*/);
+	ADC1->SAMPTR2 = 1 /*9 cycles*/ << (3 /*offset per channel*/ * AN_IN_CH /*channel*/);
 
 	// turn on ADC
 	ADC1->CTLR2 |= ADC_ADON;
@@ -147,8 +155,8 @@ void init_adc()
 	while (ADC1->CTLR2 & ADC_CAL)
 		;
 
-	// enable scanning, analog watchdog for single regular channel and interrupt
-	ADC1->CTLR1 |= ADC_SCAN | ADC_AWDSGL | ADC_AWDEN | ADC_AWDIE;
+	// enable analog watchdog for single regular channel and interrupt
+	ADC1->CTLR1 |= ADC_AWDSGL | ADC_AWDEN | ADC_AWDIE;
 
 	// set analog watchdog channel
 	ADC1->CTLR1 |= AN_IN_CH;
@@ -183,8 +191,6 @@ void ADC1_IRQHandler()
 		{
 			trig_sm = 1;
 
-			// set watchdog triggering window above trigger level
-
 			if (trig == RISING)
 			{
 				ADC1->WDLTR = 0;
@@ -204,7 +210,6 @@ void ADC1_IRQHandler()
 			ADC1->CTLR1 &= ~ADC_AWDIE & ~ADC_AWDEN; // disable the watchdog and watchdog interrupt
 			trig_sm = 0;
 
-			// set watchdog triggering window below level
 			if (trig == RISING)
 			{
 				ADC1->WDLTR = trigLevel;
@@ -316,11 +321,12 @@ void adc_set_div(uint8_t div)
 	case 4:
 		RCC->CFGR0 |= RCC_ADCPRE_DIV4;
 		break;
+	case 6:
+		RCC->CFGR0 |= RCC_ADCPRE_DIV6;
+		break;
 	case 8:
 		RCC->CFGR0 |= RCC_ADCPRE_DIV8;
 		break;
-	case 6:
-		RCC->CFGR0 |= RCC_ADCPRE_DIV6;
 	case 12:
 		RCC->CFGR0 |= 0xA000;
 		break;
@@ -350,7 +356,7 @@ void adc_set_div(uint8_t div)
 int main()
 {
 	SystemInit();
-	RCC->APB2PCENR |= RCC_APB2Periph_GPIOD | RCC_APB2Periph_GPIOC;
+	RCC->APB2PCENR |= RCC_APB2Periph_GPIOD | RCC_APB2Periph_GPIOC | RCC_APB2Periph_GPIOA;
 
 	BTN_C_GPIO->CFGLR &= ~(0xf << (4 * BTN_C_PIN));
 	BTN_C_GPIO->CFGLR |= (GPIO_Speed_In | GPIO_CNF_IN_PUPD) << (4 * BTN_C_PIN);
@@ -375,8 +381,10 @@ int main()
 	uint16_t currentDivMs;
 	uint16_t prevDivMs = SysTick->CNT / DELAY_MS_TIME;
 
-	uint8_t divSel = 0;
-	adc_set_div(availableAdcDivs[divSel]);
+	uint8_t tdivSel = 0;
+	adc_set_div(availableAdcDivs[tdivSel]);
+
+	uint8_t vdivSel = 0;
 
 	while (1)
 	{
@@ -406,11 +414,17 @@ int main()
 			{
 				switch (ui_selector)
 				{
+
+				case UI_VDIV:
+					if (vdivSel > 0)
+						vdivSel--;
+					break;
+
 				case UI_TDIV:
-					if (divSel > 0)
+					if (tdivSel > 0)
 					{
-						divSel--;
-						adc_set_div(availableAdcDivs[divSel]);
+						tdivSel--;
+						adc_set_div(availableAdcDivs[tdivSel]);
 					}
 					break;
 
@@ -445,12 +459,18 @@ int main()
 			{
 				switch (ui_selector)
 				{
-				case UI_TDIV:
 
-					divSel++;
-					if (!availableAdcDivs[divSel])
-						divSel--;
-					adc_set_div(availableAdcDivs[divSel]);
+				case UI_VDIV:
+					vdivSel++;
+					if (availableVoltDiv[vdivSel] == 0.0f)
+						vdivSel--;
+					break;
+
+				case UI_TDIV:
+					tdivSel++;
+					if (!availableAdcDivs[tdivSel])
+						tdivSel--;
+					adc_set_div(availableAdcDivs[tdivSel]);
 					break;
 
 				case UI_TRIGLEV:
@@ -502,25 +522,28 @@ int main()
 		float vmax = 0;
 		float vAvg = 0;
 
-		draw_graticule(&myGfx, 5, 5, 12);
+		draw_graticule(&myGfx, XDIV, YDIV, PIXDIV);
+		dotted_h_line(&myGfx, 0, (YDIV * PIXDIV) - 1, XDIV * PIXDIV);
 
 		// Plot the waveform and retrieve voltage min, max and avg
 		for (int i = 0; i < ((BUFFER_LENGTH)-1); i++)
 		{
-			int h1 = 59 - (readBuffer[i] / 17);
-			int h2 = 59 - (readBuffer[i + 1] / 17);
+
+			float v1 = volts_from_adc(readBuffer[i]);
+			float v2 = volts_from_adc(readBuffer[i + 1]);
+
+			uint16_t h1 = (PIXDIV * YDIV / 2 - 1) - (v1 * PIXDIV / availableVoltDiv[vdivSel]);
+			uint16_t h2 = (PIXDIV * YDIV / 2 - 1) - (v2 * PIXDIV / availableVoltDiv[vdivSel]);
 
 			gfx_draw_line(&myGfx, i, h1, i + 1, h2, WHITE);
 
-			float v = volts_from_adc(readBuffer[i]);
+			if (v1 < vmin || vmin == 0)
+				vmin = v1;
 
-			if (v < vmin || vmin == 0)
-				vmin = v;
+			if (v1 > vmax)
+				vmax = v1;
 
-			if (v > vmax)
-				vmax = v;
-
-			vAvg += v;
+			vAvg += v1;
 		}
 		vAvg /= (float)((BUFFER_LENGTH)-1);
 
@@ -535,9 +558,20 @@ int main()
 		gfx_print_string(&myGfx, "V max");
 
 		gfx_set_cursor(&myGfx, 66, 16);
-		gfx_printf(&myGfx, "%d kHz ", (int)measuredFreq / 1000);
-		// gfx_print_float(&myGfx, measuredFreq / 1000.0f );
-		// gfx_print_string( &myGfx, " kHz" );
+		// gfx_printf(&myGfx, "%d kHz ", (int)measuredFreq / 1000);
+		gfx_print_float(&myGfx, measuredFreq / 1000.0f);
+		gfx_print_string(&myGfx, " kHz");
+
+		if (ui_selector == UI_VDIV)
+			gfx_set_text_color(&myGfx, BLACK, WHITE);
+		else
+			gfx_set_text_color(&myGfx, WHITE, BLACK);
+
+		gfx_draw_fast_h_line(&myGfx, 4 * PIXDIV + 2, 24, 127 - (4 * PIXDIV + 2), WHITE);
+
+		gfx_set_cursor(&myGfx, 66, 27);
+		gfx_print_float(&myGfx, availableVoltDiv[vdivSel]);
+		gfx_print_string(&myGfx, "V/d");
 
 		float tdiv = 16 * sampPer;
 
@@ -546,7 +580,7 @@ int main()
 		else
 			gfx_set_text_color(&myGfx, WHITE, BLACK);
 
-		gfx_set_cursor(&myGfx, 66, 32);
+		gfx_set_cursor(&myGfx, 66, 35);
 		if (tdiv < 100)
 		{
 			gfx_print_float(&myGfx, 12 * sampPer);
@@ -561,12 +595,14 @@ int main()
 		if (ui_selector == UI_TRIGLEV)
 		{
 			gfx_set_text_color(&myGfx, BLACK, WHITE);
-			gfx_draw_fast_h_line(&myGfx, 1, 59 - (trigLevel / 17), 59, WHITE);
+			float vtrig = volts_from_adc(trigLevel);
+			uint16_t h = (PIXDIV * YDIV / 2 - 1) - (vtrig * PIXDIV / availableVoltDiv[vdivSel]);
+			gfx_draw_fast_h_line(&myGfx, 1, h, 63, WHITE);
 		}
 		else
 			gfx_set_text_color(&myGfx, WHITE, BLACK);
 
-		gfx_set_cursor(&myGfx, 66, 40);
+		gfx_set_cursor(&myGfx, 66, 43);
 		gfx_print_float(&myGfx, volts_from_adc(trigLevel));
 		gfx_print_string(&myGfx, "Vtr");
 
@@ -584,7 +620,7 @@ int main()
 
 		if (trigged)
 		{
-			gfx_set_cursor(&myGfx, 66, 48);
+			gfx_set_cursor(&myGfx, 66, 51);
 			gfx_print_string(&myGfx, "Trig'd");
 		}
 
