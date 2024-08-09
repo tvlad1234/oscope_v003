@@ -26,22 +26,42 @@
 #define RISING 1
 #define FALLING 0
 
-#define volts_from_adc(s) (((3.3f * s / 1023.0f) - 1.75f) * 2.0f)
+#define volts_from_adc(s) (((3.3f * s / 1023.0f) - frontend_offset) * 2.0f * atten)
+
+#define PLOT_WIDTH 64
 
 #define PIXDIV 16
 #define YDIV 4
 #define XDIV 4
+
+enum
+{
+	UI_NONE,
+	UI_VDIV,
+	UI_ATTEN,
+	UI_TDIV,
+	UI_TRIGLEV,
+	UI_TRIGSLOPE,
+	UI_RUNMODE,
+	UI_END
+};
+
+enum
+{
+	RUN_AUTO,
+	RUN_NORM,
+	RUN_END
+};
 
 // ADC capture buffers
 #define BUFFER_LENGTH 64
 volatile uint16_t buffer1[BUFFER_LENGTH] = {0};
 volatile uint16_t buffer2[BUFFER_LENGTH] = {0};
 
-volatile uint8_t dma_ready = 0; // DMA ready (conversion done) flag
-volatile uint16_t *p;			// variable used for swapping pointers around
+volatile uint8_t dma_ready = 1; // DMA ready (conversion done) flag
 
 // available volts/division
-const float availableVoltDiv[] = {0.5f, 1.0f, 2.0f, 0.0f};
+const float availableVoltDiv[] = {0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 20.0f, 0.0f};
 
 // available ADC clock dividers
 const uint8_t availableAdcDivs[] = {2, 4, 6, 8, 12, 16, 24, 32, 64, 96, 128, 0};
@@ -53,23 +73,17 @@ volatile uint16_t *readBuffer = buffer2;
 // trigger settings and flag
 volatile uint16_t trigLevel = 512;
 volatile uint8_t trig = RISING;
-volatile uint8_t trigged = 0;
+volatile uint8_t awdg_trigged = 0;
 
 volatile int wf_cnt = 0;
 
 float sampPer;
-
-enum
-{
-	UI_NONE,
-	UI_VDIV,
-	UI_TDIV,
-	UI_TRIGLEV,
-	UI_TRIGSLOPE,
-	UI_END
-};
+float atten = 1.0f;
+float frontend_offset = 1.72f;
 
 uint8_t ui_selector = UI_NONE;
+
+uint8_t runmode = RUN_NORM;
 
 // OLED and GFX instances
 ssd1306_oled myOled;
@@ -89,17 +103,23 @@ void oled_link_gfx(ssd1306_oled *oled, gfx_inst *gfx)
 	gfx_set_cursor(gfx, 0, 0);
 }
 
+void init_dma()
+{
+	// Start DMA clock
+	RCC->AHBPCENR |= RCC_AHBPeriph_DMA1;
+
+	// Enable IRQ
+	NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+}
+
 // arms the DMA to initiate waveform capture from ADC
-void arm_dma()
+void run_dma()
 {
 	// Swap the buffer pointers around
 	dma_ready = 0;
-	p = readBuffer;
+	void *p = readBuffer;
 	readBuffer = writeBuffer;
 	writeBuffer = p;
-
-	// Start DMA clock
-	RCC->AHBPCENR |= RCC_AHBPeriph_DMA1;
 
 	// Setup DMA Channel 1 (ADC triggered) as reading, 16-bit, linear buffer
 	DMA1_Channel1->CFGR =
@@ -114,9 +134,8 @@ void arm_dma()
 	// Destination
 	DMA1_Channel1->MADDR = (uint32_t)writeBuffer;
 
-	// Enable IRQ and DMA channel
-	NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-	DMA1_Channel1->CFGR |= DMA_IT_TC | DMA_CFGR1_EN;
+	// Enable DMA channel
+	DMA1_Channel1->CFGR |= DMA_CFGR1_EN | DMA_IT_TC;
 }
 
 // initializes ADC at startup
@@ -167,10 +186,6 @@ void init_adc()
 	// clear analog watchdog flag
 	ADC1->STATR = ~ADC_FLAG_AWD;
 
-	// set analog watchdog triggering window below trigger level
-	ADC1->WDLTR = trigLevel;
-	ADC1->WDHTR = 1023;
-
 	// enable ADC interrupt
 	NVIC_EnableIRQ(ADC_IRQn);
 
@@ -180,13 +195,12 @@ void init_adc()
 
 volatile uint8_t trig_sm = 0;
 
-// Interrupt handler for the ADC analog watchdog
+// Interrupt handler for the ADC analog watchdog, used for triggering
 void ADC1_IRQHandler(void) __attribute__((interrupt));
 void ADC1_IRQHandler()
 {
 	if (ADC1->STATR & ADC_FLAG_AWD)
 	{
-
 		if (trig_sm == 0)
 		{
 			trig_sm = 1;
@@ -203,30 +217,19 @@ void ADC1_IRQHandler()
 			}
 			ADC1->STATR = ~ADC_FLAG_AWD; // clear the watchdog flag
 		}
-
-		// and fire the DMA once we go above the threshold
-		else
+		else if (trig_sm == 1)
 		{
 			ADC1->CTLR1 &= ~ADC_AWDIE & ~ADC_AWDEN; // disable the watchdog and watchdog interrupt
-			trig_sm = 0;
+			awdg_trigged = 1;
+			trig_sm = 2;
 
-			if (trig == RISING)
-			{
-				ADC1->WDLTR = trigLevel;
-				ADC1->WDHTR = 1023;
-			}
-			else
-			{
-				ADC1->WDLTR = 0;
-				ADC1->WDHTR = trigLevel;
-			}
 			// start capture
-			arm_dma();
+			run_dma();
 		}
 	}
 }
 
-// Interrupt handler for the DMA
+// Interrupt handler for the DMA, fires at the end of each buffer capture
 void DMA1_Channel1_IRQHandler(void) __attribute__((interrupt));
 void DMA1_Channel1_IRQHandler()
 {
@@ -273,6 +276,7 @@ void draw_graticule(gfx_inst *gfx, uint16_t divx, uint16_t divy, uint16_t pix)
 		dotted_h_line(gfx, 0, i, wit);
 }
 
+// Calculates frequency in captured buffer
 float measure_frequency(uint16_t *readBuffer, uint16_t trigLevel, float sampPer)
 {
 	uint8_t trigged = 0;
@@ -370,7 +374,7 @@ int main()
 	BTN_R_GPIO->CFGLR |= (GPIO_Speed_In | GPIO_CNF_IN_PUPD) << (4 * BTN_R_PIN);
 	BTN_R_GPIO->BSHR = 1 << (BTN_R_PIN);
 
-	arm_dma();
+	init_dma();
 	init_adc();
 	oled_init(&myOled, 0x3C, SSD1306_SWITCHCAPVCC, 128, 64);
 	oled_link_gfx(&myOled, &myGfx);
@@ -378,30 +382,63 @@ int main()
 	uint16_t currentMs;
 	uint16_t prevMs = SysTick->CNT / DELAY_MS_TIME;
 
-	uint16_t currentDivMs;
-	uint16_t prevDivMs = SysTick->CNT / DELAY_MS_TIME;
+	uint16_t currentBtnMs;
+	uint16_t prevBtnMs = SysTick->CNT / DELAY_MS_TIME;
 
 	uint8_t tdivSel = 0;
 	adc_set_div(availableAdcDivs[tdivSel]);
 
-	uint8_t vdivSel = 0;
+	uint8_t vdivSel = 2;
+
+	uint8_t trigged;
 
 	while (1)
 	{
 		if (dma_ready)
 		{
+			trigged = 0;
+			currentMs = SysTick->CNT / DELAY_MS_TIME;
+			if (currentMs < prevMs)
+				prevMs = currentMs;
 
-			/*
-			currentDivMs = SysTick->CNT / DELAY_MS_TIME;
-			if ( currentDivMs < prevDivMs ) prevDivMs = currentDivMs;
-
-			if ( currentDivMs - prevDivMs > 2000 )
+			if (runmode == RUN_AUTO && currentMs - prevMs > 150 && !awdg_trigged)
 			{
-				// bla bla code
-
-				prevDivMs = currentDivMs;
+				run_dma();
+				prevMs = currentMs;
 			}
-			*/
+			else
+			{
+				if (awdg_trigged)
+					trigged = 1; // mark triggered
+
+				// restart capture
+				// set thresholds for triggering
+				if (trig == RISING)
+				{
+					// rising edge: arm when we're below the trigger level (outside of the set window)
+					ADC1->WDLTR = trigLevel;
+					ADC1->WDHTR = 1023;
+				}
+				else
+				{
+					// falling edge: arm when we're above the trigger level (outside of the set window)
+					ADC1->WDLTR = 0;
+					ADC1->WDHTR = trigLevel;
+				}
+				trig_sm = 0;
+				awdg_trigged = 0;					  // clear trigger flag
+				ADC1->STATR = ~ADC_FLAG_AWD;		  // clear analog watchdog flag
+				ADC1->CTLR1 |= ADC_AWDEN | ADC_AWDIE; // enable watchdog again, for next capture
+			}
+		}
+
+		// Handle buttons presses every 100 ms
+		currentBtnMs = SysTick->CNT / DELAY_MS_TIME;
+		if (currentBtnMs < prevBtnMs)
+			prevBtnMs = currentBtnMs;
+
+		if (currentBtnMs - prevBtnMs > 100)
+		{
 
 			if (!(BTN_C_GPIO->INDR & (1 << BTN_C_PIN)))
 			{
@@ -412,12 +449,50 @@ int main()
 
 			if (!(BTN_L_GPIO->INDR & (1 << BTN_L_PIN)))
 			{
+
+				if (!(BTN_R_GPIO->INDR & (1 << BTN_R_PIN))) // do calibration when L+R are pressed
+				{
+					gfx_clear(&myGfx);
+
+					if (dma_ready)
+						run_dma();
+					while (!dma_ready)
+						;
+
+					float avgVal = 0;
+					for (int i = 0; i < ((PLOT_WIDTH)-1); i++)
+					{
+						avgVal += writeBuffer[i];
+					}
+					avgVal /= (float)((PLOT_WIDTH)-1);
+					frontend_offset = 3.3f * avgVal / 1023.0f;
+
+					gfx_set_text_color(&myGfx, BLACK, WHITE);
+					gfx_print_string(&myGfx, "DC offset calibration\n\n");
+					gfx_set_text_color(&myGfx, WHITE, BLACK);
+					gfx_print_string(&myGfx, "Offset: ");
+					gfx_print_float(&myGfx, frontend_offset);
+					gfx_print_string(&myGfx, "V\nMin input: ");
+					gfx_print_float(&myGfx, volts_from_adc(0));
+					gfx_print_string(&myGfx, "V\nMax input: ");
+					gfx_print_float(&myGfx, volts_from_adc(1023));
+					gfx_print_string(&myGfx, "V");
+					gfx_flush(&myGfx);
+					while (BTN_C_GPIO->INDR & (1 << BTN_C_PIN))
+						;
+					;
+				}
+
 				switch (ui_selector)
 				{
 
 				case UI_VDIV:
 					if (vdivSel > 0)
 						vdivSel--;
+					break;
+
+				case UI_ATTEN:
+					atten = 1.0f;
 					break;
 
 				case UI_TDIV:
@@ -431,23 +506,15 @@ int main()
 				case UI_TRIGLEV:
 					if (trigLevel > 10)
 						trigLevel -= 10;
-					trig_sm = 0;
-
-					// set watchdog triggering window below level
-					if (trig == RISING)
-					{
-						ADC1->WDLTR = trigLevel;
-						ADC1->WDHTR = 1023;
-					}
-					else
-					{
-						ADC1->WDLTR = 0;
-						ADC1->WDHTR = trigLevel;
-					}
 					break;
 
 				case UI_TRIGSLOPE:
 					trig = FALLING;
+					break;
+
+				case UI_RUNMODE:
+					if (runmode > 0)
+						runmode--;
 					break;
 
 				default:
@@ -466,6 +533,10 @@ int main()
 						vdivSel--;
 					break;
 
+				case UI_ATTEN:
+					atten = 10.0f;
+					break;
+
 				case UI_TDIV:
 					tdivSel++;
 					if (!availableAdcDivs[tdivSel])
@@ -476,57 +547,33 @@ int main()
 				case UI_TRIGLEV:
 					if (trigLevel < 1013)
 						trigLevel += 10;
-					trig_sm = 0;
-
-					// set watchdog triggering window below level
-					if (trig == RISING)
-					{
-						ADC1->WDLTR = trigLevel;
-						ADC1->WDHTR = 1023;
-					}
-					else
-					{
-						ADC1->WDLTR = 0;
-						ADC1->WDHTR = trigLevel;
-					}
 					break;
 
 				case UI_TRIGSLOPE:
 					trig = RISING;
 					break;
 
+				case UI_RUNMODE:
+					runmode++;
+					if (runmode == RUN_END)
+						runmode--;
+					break;
+
 				default:
 					break;
 				}
 			}
-
-			currentMs = SysTick->CNT / DELAY_MS_TIME;
-			if (currentMs < prevMs)
-				prevMs = currentMs;
-
-			if (currentMs - prevMs > 150 && !(ADC1->STATR & ADC_FLAG_AWD))
-			{
-				trigged = 0;
-				arm_dma();
-				prevMs = currentMs;
-			}
-			else
-			{
-				trigged = 1;						  // mark triggered
-				ADC1->STATR = ~ADC_FLAG_AWD;		  // clear analog watchdog flag
-				ADC1->CTLR1 |= ADC_AWDEN | ADC_AWDIE; // enable watchdog again, for next capture
-			}
+			prevBtnMs = currentBtnMs;
 		}
-
-		float vmin = 0;
-		float vmax = 0;
-		float vAvg = 0;
-
+		// Display results
 		draw_graticule(&myGfx, XDIV, YDIV, PIXDIV);
 		dotted_h_line(&myGfx, 0, (YDIV * PIXDIV) - 1, XDIV * PIXDIV);
 
 		// Plot the waveform and retrieve voltage min, max and avg
-		for (int i = 0; i < ((BUFFER_LENGTH)-1); i++)
+		float vmin = 0;
+		float vmax = 0;
+		float vAvg = 0;
+		for (int i = 0; i < ((PLOT_WIDTH)-1); i++)
 		{
 
 			float v1 = volts_from_adc(readBuffer[i]);
@@ -545,7 +592,7 @@ int main()
 
 			vAvg += v1;
 		}
-		vAvg /= (float)((BUFFER_LENGTH)-1);
+		vAvg /= (float)((PLOT_WIDTH)-1);
 
 		float measuredFreq = measure_frequency(readBuffer, trigLevel, sampPer);
 
@@ -562,16 +609,23 @@ int main()
 		gfx_print_float(&myGfx, measuredFreq / 1000.0f);
 		gfx_print_string(&myGfx, " kHz");
 
+		gfx_draw_fast_h_line(&myGfx, 4 * PIXDIV + 2, 24, 127 - (4 * PIXDIV + 2), WHITE);
+
 		if (ui_selector == UI_VDIV)
 			gfx_set_text_color(&myGfx, BLACK, WHITE);
 		else
 			gfx_set_text_color(&myGfx, WHITE, BLACK);
 
-		gfx_draw_fast_h_line(&myGfx, 4 * PIXDIV + 2, 24, 127 - (4 * PIXDIV + 2), WHITE);
-
 		gfx_set_cursor(&myGfx, 66, 27);
 		gfx_print_float(&myGfx, availableVoltDiv[vdivSel]);
 		gfx_print_string(&myGfx, "V/d");
+
+		if (ui_selector == UI_ATTEN)
+			gfx_set_text_color(&myGfx, BLACK, WHITE);
+		else
+			gfx_set_text_color(&myGfx, WHITE, BLACK);
+
+		gfx_printf(&myGfx, " %d", (int)atten);
 
 		float tdiv = 16 * sampPer;
 
@@ -616,13 +670,28 @@ int main()
 		else
 			gfx_print_string(&myGfx, " F");
 
-		gfx_set_text_color(&myGfx, WHITE, BLACK);
+		if (ui_selector == UI_RUNMODE)
+			gfx_set_text_color(&myGfx, BLACK, WHITE);
+		else
+			gfx_set_text_color(&myGfx, WHITE, BLACK);
+		gfx_set_cursor(&myGfx, 66, 51);
 
-		if (trigged)
+		switch (runmode)
 		{
-			gfx_set_cursor(&myGfx, 66, 51);
-			gfx_print_string(&myGfx, "Trig'd");
+		case RUN_AUTO:
+			gfx_print_string(&myGfx, "Auto");
+			break;
+		case RUN_NORM:
+			gfx_print_string(&myGfx, "Norm");
+		default:
+			break;
 		}
+
+		gfx_set_text_color(&myGfx, WHITE, BLACK);
+		if (trigged)
+			gfx_print_string(&myGfx, " Tr'd");
+		else if (runmode == RUN_NORM)
+			gfx_print_string(&myGfx, " Wait");
 
 		/*
 		gfx_set_cursor( &myGfx, 66, 48 );
